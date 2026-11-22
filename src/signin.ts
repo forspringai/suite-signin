@@ -2,6 +2,7 @@ import { createRemoteJWKSet, customFetch, jwtVerify, type JWTPayload, type JWTVe
 
 import { assertHostCookieName, clearCookie, readCookie, setCookie } from "./cookies.js";
 import { basicAuth, codeChallengeS256, constantTimeEqual, RAW_TOKEN, randomToken, sha256 } from "./encoding.js";
+import { rateLimitAddress } from "./rate-key.js";
 import { safeReturnTo } from "./return-to.js";
 import { absoluteExpiry, fromSeconds, newSession, resolveLifetimes, toSeconds } from "./session.js";
 import type {
@@ -30,9 +31,43 @@ const PRODUCT = /^[a-z0-9-]{1,32}$/;
 const RATE_WINDOW_S = 60;
 const RATE_LIMIT = 10;
 const TOKEN_TIMEOUT_MS = 10_000;
-const MAX_LOGOUT_TOKEN = 16_384;
+/** A back-channel logout body (logout_token=<JWT>) is at most 16 KB. */
+const MAX_BODY_BYTES = 16_384;
+const TOO_LARGE = Symbol("too large");
 
 class EmailNotVerified extends Error {}
+
+/**
+ * The body as text, reading no more than `cap` bytes: a body that goes past it is cancelled and
+ * answered TOO_LARGE, whatever its Content-Length said. An unreadable body reads as "".
+ */
+async function readCapped(request: Request, cap: number): Promise<string | typeof TOO_LARGE> {
+  if (!request.body) return "";
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > cap) {
+        await reader.cancel().catch(() => {});
+        return TOO_LARGE;
+      }
+      chunks.push(value);
+    }
+  } catch {
+    return "";
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes);
+}
 
 /** JWKS resolvers, per transport and URL, so one isolate fetches the keys once and reuses them. */
 const jwksCache = new WeakMap<FetchLike, Map<string, JWTVerifyGetKey>>();
@@ -117,7 +152,12 @@ export function suiteSignIn(config: SuiteSignInConfig): SuiteSignIn {
   assertHostCookieName(cookieName, "cookie.name");
   const loginName = config.cookie.loginName ?? `__Host-${product}_login`;
   assertHostCookieName(loginName, "cookie.loginName");
-  if (loginName === cookieName) throw new TypeError("suite-signin: cookie.loginName must differ from cookie.name");
+  // The per-attempt suffix must still make a valid name.
+  assertHostCookieName(`${loginName}_AAAAAAAA`, "cookie.loginName (with its 9-character attempt suffix)");
+  if (loginName === cookieName || cookieName.startsWith(`${loginName}_`)) {
+    throw new TypeError("suite-signin: cookie.loginName must differ from cookie.name");
+  }
+  const loginCookieName = (stateHash: string) => `${loginName}_${stateHash.slice(0, 8)}`;
 
   const store = config.store;
   if (!store || typeof store.takeLogin !== "function") throw new TypeError("suite-signin: store is required");
@@ -150,18 +190,28 @@ export function suiteSignIn(config: SuiteSignInConfig): SuiteSignIn {
       : config.log
         ? (e) => (config.log as (event: SignInLogEvent) => void)({ product, ...e })
         : (e) => console.log(JSON.stringify({ msg: "suite-signin", product, ...e }));
-  const rateLimit = config.rateLimit;
+  const rateLimit = config.rateLimit ?? {};
+  let rateWindowS = RATE_WINDOW_S;
+  let rateLimitCount = RATE_LIMIT;
+  if (rateLimit !== false && typeof rateLimit !== "function") {
+    if (rateLimit === null || typeof rateLimit !== "object") throw new TypeError("suite-signin: rateLimit must be { limit, windowS }, a function or false");
+    rateWindowS = rateLimit.windowS ?? RATE_WINDOW_S;
+    rateLimitCount = rateLimit.limit ?? RATE_LIMIT;
+    if (!Number.isInteger(rateWindowS) || rateWindowS <= 0) throw new TypeError("suite-signin: rateLimit.windowS must be a positive integer");
+    if (!Number.isInteger(rateLimitCount) || rateLimitCount <= 0) throw new TypeError("suite-signin: rateLimit.limit must be a positive integer");
+  }
   const onSignIn = config.onSignIn;
 
   // ---- helpers ----------------------------------------------------------------------------
 
   async function allowed(kind: "start" | "callback", request: Request): Promise<boolean> {
     if (rateLimit === false) return true;
-    const raw = request.headers.get(ipHeader)?.trim() ?? "";
-    const ip = /^[0-9A-Fa-f:.]{1,64}$/.test(raw) ? raw.toLowerCase() : "unknown";
-    const key = `${kind}:${ip}`;
-    if (rateLimit) return await rateLimit(key);
-    return await store.hit(key, RATE_WINDOW_S, RATE_LIMIT, toSeconds(clock()));
+    // No usable address: not limited, rather than one bucket shared by every such request.
+    const address = rateLimitAddress(request.headers.get(ipHeader));
+    if (address === null) return true;
+    const key = `${kind}:${address}`;
+    if (typeof rateLimit === "function") return await rateLimit(key);
+    return await store.hit(key, rateWindowS, rateLimitCount, toSeconds(clock()));
   }
 
   async function exchangeCode(code: string, verifier: string): Promise<string> {
@@ -269,11 +319,13 @@ export function suiteSignIn(config: SuiteSignInConfig): SuiteSignIn {
       url.searchParams.set("code_challenge", await codeChallengeS256(verifier));
       url.searchParams.set("code_challenge_method", "S256");
       log({ event: "start" });
-      return { ok: true, location: url.toString(), setCookie: [setCookie(loginName, binding, lifetimes.loginS)] };
+      // One cookie per attempt, named from the state's hash, so parallel tabs keep their own.
+      const cookie = setCookie(loginCookieName(await sha256(state)), binding, lifetimes.loginS);
+      return { ok: true, location: url.toString(), setCookie: [cookie] };
     },
 
     async callback(request): Promise<CallbackResult> {
-      const clearLogin = [clearCookie(loginName)];
+      let clearLogin: string[] = [];
       const refuse = (refused: CallbackRefusal, detail?: string): CallbackResult => {
         log({ event: "callback_refused", reason: refused });
         return detail === undefined ? { ok: false, refused, setCookie: clearLogin } : { ok: false, refused, detail, setCookie: clearLogin };
@@ -287,18 +339,22 @@ export function suiteSignIn(config: SuiteSignInConfig): SuiteSignIn {
 
       // The login row is taken (deleted) first, so a state is never usable twice, even after an error.
       const state = params.get("state");
-      const login = state !== null && RAW_TOKEN.test(state) ? await store.takeLogin(await sha256(state)) : null;
+      const stateHash = state !== null && RAW_TOKEN.test(state) ? await sha256(state) : null;
+      const thisLoginCookie = stateHash === null ? null : loginCookieName(stateHash);
+      if (thisLoginCookie !== null) clearLogin = [clearCookie(thisLoginCookie)];
+      const login = stateHash === null ? null : await store.takeLogin(stateHash);
+      // RFC 9207: the account names itself on every redirect back, success or error. Checked first,
+      // so an error= that claims to come from another issuer is not believed either.
+      if (params.get("iss") !== endpoints.issuer) return refuse("iss_mismatch");
       if (params.has("error")) return refuse("account_error");
       if (state === null || state === "") return refuse("bad_request");
-      if (!login) return refuse("no_login");
+      if (!login || thisLoginCookie === null) return refuse("no_login");
       if (login.expiresAt <= nowS) return refuse("expired");
 
-      const binding = readCookie(request, loginName);
+      const binding = readCookie(request, thisLoginCookie);
       if (binding === null || !RAW_TOKEN.test(binding) || !constantTimeEqual(await sha256(binding), login.bindingHash)) {
         return refuse("binding_mismatch");
       }
-      const iss = params.get("iss");
-      if (iss !== null && iss !== endpoints.issuer) return refuse("issuer_mismatch");
       const code = params.get("code");
       if (code === null || code === "") return refuse("bad_request");
 
@@ -323,6 +379,10 @@ export function suiteSignIn(config: SuiteSignInConfig): SuiteSignIn {
         const verdict = await onSignIn(person, request);
         if (verdict && typeof verdict === "object" && typeof verdict.refuse === "string") return refuse("product_refused", verdict.refuse);
       }
+
+      // A session this browser already holds is ended, not left behind beside the new one.
+      const previous = readCookie(request, cookieName);
+      if (previous !== null && RAW_TOKEN.test(previous)) await store.deleteSession(await sha256(previous));
 
       const { raw, row } = await newSession(person, idToken, nowS, lifetimes);
       await store.createSession(row);
@@ -381,9 +441,12 @@ export function suiteSignIn(config: SuiteSignInConfig): SuiteSignIn {
       if (request.method !== "POST") return refuse("method_not_allowed", 405);
       const type = request.headers.get("content-type") ?? "";
       if (!/^application\/x-www-form-urlencoded\b/i.test(type)) return refuse("no_logout_token");
-      const body = await request.text().catch(() => "");
+      const length = request.headers.get("content-length");
+      if (length !== null && !(/^\d{1,10}$/.test(length) && Number(length) <= MAX_BODY_BYTES)) return refuse("too_large");
+      const body = await readCapped(request, MAX_BODY_BYTES);
+      if (body === TOO_LARGE) return refuse("too_large");
       const token = new URLSearchParams(body).get("logout_token");
-      if (!token || token.length > MAX_LOGOUT_TOKEN) return refuse("no_logout_token");
+      if (!token) return refuse("no_logout_token");
 
       const now = clock();
       let payload: JWTPayload;

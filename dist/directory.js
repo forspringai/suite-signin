@@ -43,7 +43,8 @@ export function accountDirectory(options) {
         catch {
             throw new AccountUnavailableError("no answer");
         }
-        if (response.status >= 500 || response.status === 401 || response.status === 403) {
+        // A 404 is an answer (the person or org is not known: `ok: false`); any other non-2xx is not.
+        if (!response.ok && response.status !== 404) {
             throw new AccountUnavailableError(`status ${response.status}`);
         }
         const body = (await response.json().catch(() => null));

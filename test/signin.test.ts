@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { sha256 } from "../src/encoding.js";
-import { issueSessionForTests, redirect, sessionIdHash, suiteSignIn } from "../src/index.js";
+import * as main from "../src/index.js";
+import { redirect, sessionIdHash, suiteSignIn } from "../src/index.js";
+import { issueSessionForTests } from "../src/testing.js";
 import type { CallbackResult, SuiteSignInConfig } from "../src/types.js";
 import { APP, CLIENT_ID, CLIENT_SECRET, cookiePair, cookieValue, ISSUER, POST_LOGOUT, REDIRECT_URI } from "./fake-account.js";
 import { baseConfig, harness, LOGIN_COOKIE, SESSION_COOKIE } from "./harness.js";
@@ -143,7 +145,8 @@ describe("start", () => {
     const started = await h.signin.start(h.get("/sign-in"));
     if (!started.ok) throw new Error("refused");
     const cookie = started.setCookie[0] ?? "";
-    expect(cookie.startsWith(`${LOGIN_COOKIE}=`)).toBe(true);
+    const state = new URL(started.location).searchParams.get("state") ?? "";
+    expect(cookie.startsWith(`${LOGIN_COOKIE}_${(await sha256(state)).slice(0, 8)}=`)).toBe(true);
     for (const attr of ["Path=/", "Max-Age=600", "HttpOnly", "Secure", "SameSite=Lax"]) expect(cookie).toContain(attr);
     expect(cookie.toLowerCase()).not.toContain("domain");
     const value = cookieValue(cookie);
@@ -183,7 +186,7 @@ describe("callback", () => {
     });
     expect(result.returnTo).toBe("/o/acme/");
     expect(result.setCookie).toHaveLength(2);
-    expect(result.setCookie[1]).toBe(`${LOGIN_COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax`);
+    expect(result.setCookie[1]).toMatch(/^__Host-sitespring_login_[A-Za-z0-9_-]{8}=; Path=\/; Max-Age=0; HttpOnly; Secure; SameSite=Lax$/);
   });
 
   it("exchanges the code with client_secret_basic and the PKCE verifier", async () => {
@@ -245,23 +248,39 @@ describe("callback", () => {
     const { callbackUrl, loginCookie } = await h.begin();
     const url = new URL(callbackUrl);
     const state = url.searchParams.get("state") ?? "";
-    const failed = `${REDIRECT_URI}?error=access_denied&state=${state}`;
+    const failed = `${REDIRECT_URI}?error=access_denied&state=${state}&iss=${encodeURIComponent(ISSUER)}`;
     expect(refusedOf(await h.signin.callback(h.callbackRequest(failed, loginCookie)))).toBe("account_error");
     expect(refusedOf(await h.signin.callback(h.callbackRequest(callbackUrl, loginCookie)))).toBe("no_login");
   });
 
-  it("refuses a callback with no state, no code, an unknown state, or another issuer", async () => {
+  it("refuses a callback with no state, no code, or an unknown state", async () => {
     const h = await harness();
-    expect(refusedOf(await h.signin.callback(h.callbackRequest(`${REDIRECT_URI}?code=x`, null)))).toBe("bad_request");
-    expect(refusedOf(await h.signin.callback(h.callbackRequest(`${REDIRECT_URI}?code=x&state=${"a".repeat(43)}`, null)))).toBe("no_login");
+    const iss = `iss=${encodeURIComponent(ISSUER)}`;
+    expect(refusedOf(await h.signin.callback(h.callbackRequest(`${REDIRECT_URI}?code=x&${iss}`, null)))).toBe("bad_request");
+    expect(refusedOf(await h.signin.callback(h.callbackRequest(`${REDIRECT_URI}?code=x&state=${"a".repeat(43)}&${iss}`, null)))).toBe("no_login");
     const one = await h.begin();
     const noCode = new URL(one.callbackUrl);
     noCode.searchParams.delete("code");
     expect(refusedOf(await h.signin.callback(h.callbackRequest(noCode.toString(), one.loginCookie)))).toBe("bad_request");
-    const two = await h.begin();
-    const mixUp = new URL(two.callbackUrl);
+  });
+
+  it("requires iss (RFC 9207) to be the issuer, on success and error redirects alike, before error= is read", async () => {
+    const h = await harness();
+    const wrong = await h.begin();
+    const mixUp = new URL(wrong.callbackUrl);
     mixUp.searchParams.set("iss", "https://evil.example/api/auth");
-    expect(refusedOf(await h.signin.callback(h.callbackRequest(mixUp.toString(), two.loginCookie)))).toBe("issuer_mismatch");
+    expect(refusedOf(await h.signin.callback(h.callbackRequest(mixUp.toString(), wrong.loginCookie)))).toBe("iss_mismatch");
+
+    const missing = await h.begin();
+    const noIss = new URL(missing.callbackUrl);
+    noIss.searchParams.delete("iss");
+    expect(refusedOf(await h.signin.callback(h.callbackRequest(noIss.toString(), missing.loginCookie)))).toBe("iss_mismatch");
+
+    expect(refusedOf(await h.signin.callback(h.callbackRequest(`${REDIRECT_URI}?error=access_denied`, null)))).toBe("iss_mismatch");
+    expect(refusedOf(await h.signin.callback(h.callbackRequest(`${REDIRECT_URI}?error=access_denied&iss=https%3A%2F%2Fevil.example`, null)))).toBe("iss_mismatch");
+    // Each refused callback still burned its login row.
+    expect(refusedOf(await h.signin.callback(h.callbackRequest(missing.callbackUrl, missing.loginCookie)))).toBe("no_login");
+    expect(h.store.sessions.size).toBe(0);
   });
 
   it("answers a refused or unreachable token endpoint as token_exchange_failed", async () => {
@@ -339,8 +358,10 @@ describe("callback", () => {
 
   it("never draws HTML: a refusal is data plus the cleared login cookie", async () => {
     const h = await harness();
-    const result = await h.signin.callback(h.callbackRequest(`${REDIRECT_URI}?error=access_denied`, null));
-    expect(result).toEqual({ ok: false, refused: "account_error", setCookie: [`${LOGIN_COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax`] });
+    const { callbackUrl, loginCookie } = await h.begin();
+    const state = new URL(callbackUrl).searchParams.get("state") ?? "";
+    const result = await h.signin.callback(h.callbackRequest(`${REDIRECT_URI}?error=access_denied&state=${state}&iss=${encodeURIComponent(ISSUER)}`, loginCookie));
+    expect(result).toEqual({ ok: false, refused: "account_error", setCookie: [`${cookiePair(loginCookie).split("=")[0]}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax`] });
   });
 });
 
@@ -358,7 +379,7 @@ describe("rate limit", () => {
 
   it("counts callbacks per IP separately from starts", async () => {
     const h = await harness();
-    const cb = () => h.signin.callback(h.callbackRequest(`${REDIRECT_URI}?error=x`, null, "198.51.100.9"));
+    const cb = () => h.signin.callback(h.callbackRequest(`${REDIRECT_URI}?error=x&iss=${encodeURIComponent(ISSUER)}`, null, "198.51.100.9"));
     for (let i = 0; i < 10; i += 1) expect(refusedOf(await cb())).toBe("account_error");
     expect(refusedOf(await cb())).toBe("rate_limited");
     expect((await h.signin.start(new Request(`${APP}/sign-in`, { headers: { "cf-connecting-ip": "198.51.100.9" } }))).ok).toBe(true);
@@ -674,5 +695,106 @@ describe("secrets never reach logs or errors", () => {
     } finally {
       for (const spy of spies) spy.mockRestore();
     }
+  });
+});
+
+describe("security read fixes", () => {
+  const ipStart = (h: Awaited<ReturnType<typeof harness>>, headers: Record<string, string>) =>
+    h.signin.start(new Request(`${APP}/sign-in`, { headers }));
+
+  it("keys an IPv6 address by its /64", async () => {
+    const h = await harness();
+    for (let i = 1; i <= 10; i += 1) expect((await ipStart(h, { "cf-connecting-ip": `2001:db8:1:2::${i.toString(16)}` })).ok).toBe(true);
+    expect((await ipStart(h, { "cf-connecting-ip": "2001:0db8:0001:0002:ffff:ffff:ffff:ffff" })).ok).toBe(false);
+    expect((await ipStart(h, { "cf-connecting-ip": "2001:db8:1:3::1" })).ok).toBe(true);
+    expect([...h.store.hits.keys()].map((k) => k.split("@")[0])).toEqual(["start:2001:db8:1:2::/64", "start:2001:db8:1:3::/64"]);
+  });
+
+  it("takes rateLimit as { limit, windowS }", async () => {
+    const h = await harness({ rateLimit: { limit: 2, windowS: 10 } });
+    const ip = { "cf-connecting-ip": "198.51.100.20" };
+    expect((await ipStart(h, ip)).ok).toBe(true);
+    expect((await ipStart(h, ip)).ok).toBe(true);
+    expect((await ipStart(h, ip)).ok).toBe(false);
+    h.advance(10);
+    expect((await ipStart(h, ip)).ok).toBe(true);
+    const config = baseConfig(h.store, h.account, h.clock, []);
+    expect(() => suiteSignIn({ ...config, rateLimit: { limit: 0 } })).toThrow(/rateLimit.limit/);
+    expect(() => suiteSignIn({ ...config, rateLimit: { windowS: 1.5 } })).toThrow(/rateLimit.windowS/);
+  });
+
+  it("does not limit a request with no usable address, rather than sharing one bucket", async () => {
+    const calls: string[] = [];
+    const h = await harness();
+    for (let i = 0; i < 15; i += 1) expect((await ipStart(h, {})).ok).toBe(true);
+    for (let i = 0; i < 15; i += 1) expect((await ipStart(h, { "cf-connecting-ip": "not-an-address" })).ok).toBe(true);
+    expect(h.store.hits.size).toBe(0);
+    const custom = await harness({ rateLimit: async (key) => (calls.push(key), false) });
+    expect((await ipStart(custom, {})).ok).toBe(true);
+    expect(calls).toEqual([]);
+  });
+
+  it("refuses a back-channel body over 16 KB, by Content-Length or as read", async () => {
+    const h = await harness();
+    const cookie = await signedInCookie(h);
+    const token = await h.account.signLogoutToken();
+    const post = (body: string, headers: Record<string, string> = {}) =>
+      h.signin.backchannelLogout(
+        new Request(`${APP}/forspring/logout`, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", ...headers }, body }),
+      );
+    const big = await post(`logout_token=${token}`, { "content-length": "16385" });
+    expect(big).toMatchObject({ ok: false, refused: "too_large" });
+    expect(big.response.status).toBe(400);
+    expect(await post(`logout_token=${token}`, { "content-length": "12abc" })).toMatchObject({ refused: "too_large" });
+    // No Content-Length on the request: the read itself stops at the cap.
+    expect(await post(`logout_token=${token}&pad=${"a".repeat(16_384)}`)).toMatchObject({ refused: "too_large" });
+    expect(await h.signin.session(h.get("/", cookie))).not.toBeNull();
+    expect(await post(`logout_token=${token}`)).toMatchObject({ ok: true, ended: 1 });
+  });
+
+  it("keeps issueSessionForTests out of the main entry", () => {
+    expect("issueSessionForTests" in main).toBe(false);
+    expect(typeof main.sessionIdHash).toBe("function");
+  });
+
+  it("ends the session the browser already holds when it signs in again", async () => {
+    const h = await harness();
+    const first = await signedInCookie(h);
+    const firstHash = await sha256(cookieValue(first));
+    const { callbackUrl, loginCookie } = await h.begin();
+    const result = await h.signin.callback(h.callbackRequest(callbackUrl, `${first}; ${loginCookie}`));
+    if (!result.ok) throw new Error(result.refused);
+    expect(h.store.sessions.has(firstHash)).toBe(false);
+    expect(h.store.sessions.size).toBe(1);
+    expect(await h.signin.session(h.get("/", first))).toBeNull();
+    expect(await h.signin.session(h.get("/", cookiePair(result.setCookie[0])))).not.toBeNull();
+  });
+
+  it("lets two tabs sign in in parallel, each with its own login cookie", async () => {
+    const h = await harness();
+    const a = await h.begin({ returnTo: "/a" });
+    const b = await h.begin({ returnTo: "/b" });
+    expect(cookiePair(a.loginCookie).split("=")[0]).not.toBe(cookiePair(b.loginCookie).split("=")[0]);
+    const both = `${a.loginCookie}; ${b.loginCookie}`;
+    const rb = await h.signin.callback(h.callbackRequest(b.callbackUrl, both));
+    const ra = await h.signin.callback(h.callbackRequest(a.callbackUrl, both));
+    expect(rb).toMatchObject({ ok: true, returnTo: "/b" });
+    expect(ra).toMatchObject({ ok: true, returnTo: "/a" });
+    // Each callback clears only its own attempt's cookie.
+    expect(rb.setCookie[1]?.split("=")[0]).toBe(cookiePair(b.loginCookie).split("=")[0]);
+  });
+
+  it("refuses another attempt's binding value under this attempt's cookie name", async () => {
+    const h = await harness();
+    const victim = await h.begin();
+    const attacker = await h.begin();
+    const forged = `${cookiePair(victim.loginCookie).split("=")[0]}=${cookieValue(attacker.loginCookie)}`;
+    expect(refusedOf(await h.signin.callback(h.callbackRequest(victim.callbackUrl, forged)))).toBe("binding_mismatch");
+  });
+
+  it("refuses a login cookie name that leaves no room for the attempt suffix", async () => {
+    const h = await harness();
+    const config = baseConfig(h.store, h.account, h.clock, []);
+    expect(() => suiteSignIn({ ...config, cookie: { name: SESSION_COOKIE, loginName: `__Host-${"l".repeat(60)}` } })).toThrow(/attempt suffix/);
   });
 });

@@ -81,8 +81,10 @@ describe("accountDirectory", () => {
   });
 
   it("throws AccountUnavailableError, never naming the secret, when the account cannot answer", async () => {
-    for (const failing of [() => new Response("boom", { status: 503 }), () => new Response("no", { status: 401 }), () => new Response("not json")]) {
-      const dir = accountDirectory({ issuer: ISSUER, clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, fetch: fakeDirectory(failing).fetch });
+    const statuses = [503, 500, 401, 403, 400, 429, 302, 410];
+    const failing = [...statuses.map((status) => () => new Response(JSON.stringify({ ok: true, orgs: [] }), { status })), () => new Response("not json")];
+    for (const failing1 of failing) {
+      const dir = accountDirectory({ issuer: ISSUER, clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, fetch: fakeDirectory(failing1).fetch });
       const error = await dir.orgsOf("s").catch((e: unknown) => e);
       expect(error).toBeInstanceOf(AccountUnavailableError);
       expect(String(error)).not.toContain(CLIENT_SECRET);
@@ -91,5 +93,12 @@ describe("accountDirectory", () => {
     const error = await down.orgsOf("s").catch((e: unknown) => e);
     expect(error).toBeInstanceOf(AccountUnavailableError);
     expect(String(error)).not.toContain(CLIENT_SECRET);
+  });
+
+  it("reads a 404 as the account's answer: not in the org", async () => {
+    const d = fakeDirectory(() => Response.json({ ok: false, reason: "customer_not_found" }, { status: 404 }));
+    const dir = accountDirectory({ issuer: ISSUER, clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, fetch: d.fetch });
+    expect(await dir.roleIn("s", "cus_x")).toBeNull();
+    expect(await dir.orgsOf("s")).toEqual([]);
   });
 });

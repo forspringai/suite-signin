@@ -1,6 +1,6 @@
 export { suiteSignIn, accountEndpoints, redirect } from "./signin.js";
 export { safeReturnTo } from "./return-to.js";
-export { DEFAULT_LIFETIMES, issueSessionForTests, sessionIdHash } from "./session.js";
+export { DEFAULT_LIFETIMES, sessionIdHash } from "./session.js";
 export { d1SignInStore, migrationSql } from "./d1.js";
 export type { D1Like, D1StatementLike } from "./d1.js";
 export type {
@@ -13,6 +13,7 @@ export type {
   Lifetimes,
   LoginRow,
   Person,
+  RateLimitOptions,
   SessionQuery,
   SessionRow,
   SignedIn,

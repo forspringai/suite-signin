@@ -116,8 +116,8 @@ export type CallbackRefusal =
  | "expired"
 /** The login was started in another browser (or its binding cookie is gone). */
  | "binding_mismatch"
-/** The callback's `iss` (RFC 9207) names another issuer. */
- | "issuer_mismatch"
+/** The callback's `iss` (RFC 9207) is missing or names another issuer. Checked before `error=`. */
+ | "iss_mismatch"
 /** The token endpoint refused the code or could not be reached. */
  | "token_exchange_failed"
 /** The id_token failed signature, iss, aud, exp, iat, alg, nonce or claim checks. */
@@ -157,7 +157,9 @@ export type SignOutResult = {
     refused: "method_not_allowed" | "cross_origin";
     setCookie: string[];
 };
-export type BackchannelRefusal = "method_not_allowed" | "no_logout_token" | "invalid_logout_token" | "not_a_logout_event" | "nonce_present" | "no_sid_or_sub" | "no_jti" | "replayed";
+export type BackchannelRefusal = "method_not_allowed" | "no_logout_token" | "invalid_logout_token" | "not_a_logout_event" | "nonce_present" | "no_sid_or_sub" | "no_jti" | "replayed"
+/** The body is over 16 KB (by Content-Length, or as read). */
+ | "too_large";
 export type BackchannelResult = {
     ok: true;
     ended: number;
@@ -173,6 +175,12 @@ export interface SignInLogEvent {
     event: "start" | "start_refused" | "callback_ok" | "callback_refused" | "session_expired" | "sign_out" | "backchannel_ok" | "backchannel_refused" | "end_for";
     reason?: string;
     count?: number;
+}
+export interface RateLimitOptions {
+    /** Requests per key per window. Default 10. */
+    limit?: number;
+    /** The fixed window, in seconds. Default 60. */
+    windowS?: number;
 }
 export interface SignInHookRefusal {
     refuse: string;
@@ -195,7 +203,11 @@ export interface SuiteSignInConfig {
     cookie: {
         /** The session cookie: must start with `__Host-`. */
         name: string;
-        /** The login-binding cookie. Default `__Host-<product>_login`; must start with `__Host-`. */
+        /**
+         * The login-binding cookie's base name. Default `__Host-<product>_login`; must start with
+         * `__Host-`. Each sign-in attempt gets its own cookie, `<loginName>_<first 8 characters of the
+         * state's SHA-256, base64url>`, so sign-ins in parallel tabs do not clash.
+         */
         loginName?: string;
     };
     store: SignInStore;
@@ -203,10 +215,13 @@ export interface SuiteSignInConfig {
     algorithms?: readonly string[];
     lifetimes?: Partial<Lifetimes>;
     /**
-     * Answers true when the request may go ahead. Called with `start:<ip>` and `callback:<ip>`.
-     * Default: the store's fixed window, 10 per key per 60 seconds. `false` turns it off.
+     * Default `{ limit: 10, windowS: 60 }`: the store's fixed window per `start:<addr>` and
+     * `callback:<addr>`, where <addr> is an IPv4 address or an IPv6 /64. A function answers true when
+     * the request may go ahead and is called with the same keys. `false` turns limiting off. A request
+     * with no usable address in `ipHeader` is not limited, rather than sharing one bucket with all
+     * other such requests.
      */
-    rateLimit?: ((key: string) => Promise<boolean>) | false;
+    rateLimit?: RateLimitOptions | ((key: string) => Promise<boolean>) | false;
     /** The header holding the client's address. Default `cf-connecting-ip`; `x-forwarded-for` is refused. */
     ipHeader?: string;
     /** Product hook after the id_token is verified and before any session exists. */

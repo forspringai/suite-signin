@@ -1,5 +1,5 @@
 import { randomToken, sha256 } from "./encoding.js";
-import type { Lifetimes, Person, SessionRow, SignInStore, UnixSeconds } from "./types.js";
+import type { Lifetimes, Person, SessionRow, UnixSeconds } from "./types.js";
 
 const DAY_S = 86_400;
 
@@ -64,25 +64,4 @@ export async function newSession(
     absoluteExpiresAt,
   };
   return { raw, row };
-}
-
-/**
- * Tests only: seeds a signed-in browser without an account round trip. Writes a session row the
- * way a real sign-in does and answers the raw cookie value (send it as `<cookie name>=<raw>`) and
- * the hash the store keys it by.
- */
-export async function issueSessionForTests(
-  store: SignInStore,
-  person: { sub: string; email: string; name?: string | null; sid?: string | null; authTime?: Date | null },
-  options: { now?: Date; lifetimes?: Partial<Lifetimes>; idToken?: string | null } = {},
-): Promise<{ raw: string; idHash: string; row: SessionRow }> {
-  const nowS = toSeconds(options.now ?? new Date());
-  const { raw, row } = await newSession(
-    { sub: person.sub, email: person.email, name: person.name ?? null, sid: person.sid ?? null, authTime: person.authTime ?? null },
-    options.idToken ?? null,
-    nowS,
-    resolveLifetimes(options.lifetimes),
-  );
-  await store.createSession(row);
-  return { raw, idHash: row.idHash, row };
 }

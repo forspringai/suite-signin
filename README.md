@@ -22,7 +22,7 @@ Everything product-specific is config: nothing about a product's paths or client
 import { suiteSignIn, d1SignInStore, redirect } from "@forspring/suite-signin";
 
 const signin = suiteSignIn({
-  product: "sitespring",                                   // logs; default login cookie __Host-sitespring_login
+  product: "sitespring",                                   // logs; default login cookie base __Host-sitespring_login
   account: {
     issuer: "https://account.forspring.ai/api/auth",       // endpoints derived from it, no discovery fetch
     clientId: "sitespring",
@@ -36,13 +36,19 @@ const signin = suiteSignIn({
   // optional:
   algorithms: ["EdDSA"],                                   // default; asymmetric algorithms only
   lifetimes: { idleS: 7 * 86400, renewS: 86400, absoluteS: 30 * 86400, loginS: 600 }, // defaults
-  rateLimit: undefined,                                    // default: the store, 10 starts + 10 callbacks / IP / minute
+  rateLimit: { limit: 10, windowS: 60 },                   // default; or (key) => Promise<boolean>, or false
   ipHeader: "cf-connecting-ip",                            // default; x-forwarded-for is refused
   onSignIn: async (person, req) => undefined,              // or { refuse: "product_off" }: no session is made
   fetch: undefined,                                        // transport for /oauth2/token and /jwks
   userAgent: "SiteSpring/1 (+https://sitespring.app)",
 });
 ```
+
+`redirectUri` and `postLogoutRedirectUri` are normalised with `URL.toString()` (so
+`https://App.Example/` and `https://app.example:443/` both become `https://app.example/`, and a
+bare origin gains a trailing `/`). They are sent to the account in that form, and the account
+compares them exactly: register each one at the account exactly as `new URL(uri).toString()`
+prints it.
 
 The account's endpoints, from the issuer: `{issuer}/oauth2/authorize`, `{issuer}/oauth2/token`
 (`client_secret_basic`), `{issuer}/jwks` and `{issuer}/oauth2/end-session`.
@@ -83,7 +89,7 @@ return (await signin.backchannelLogout(req)).response;
 
 Callback refusals: `rate_limited`, `account_error` (an `error=` from authorize), `bad_request`,
 `no_login` (unknown or already used), `expired`, `binding_mismatch` (another browser),
-`issuer_mismatch` (RFC 9207 `iss`), `token_exchange_failed`, `invalid_id_token`,
+`iss_mismatch` (RFC 9207: `iss` missing or not the issuer, checked before `error=`), `token_exchange_failed`, `invalid_id_token`,
 `email_not_verified`, `auth_too_old`, `product_refused` (with `detail`).
 
 `returnTo` is a same-origin path with its query string, against the `redirectUri`'s origin.
@@ -95,7 +101,12 @@ Anything else (`//host`, `/\host`, an absolute URL, control characters, a backsl
 - **state, nonce, PKCE verifier and the browser binding** are each 32 bytes from
   `crypto.getRandomValues`, base64url. PKCE is S256. The login row is stored with the state, nonce and
   binding as SHA-256 only (the verifier must be sent, so it is kept as it is); it is single use
-  (delete-returning), lives 10 minutes, and is bound to the browser by `__Host-<product>_login`.
+  (delete-returning), lives 10 minutes, and is bound to the browser by its own cookie,
+  `__Host-<product>_login_<first 8 characters of the state's SHA-256>`, which expires with it. The
+  callback finds its cookie from the returned state, so sign-ins in parallel tabs do not clash.
+- **The callback requires `iss`** (RFC 9207) on every redirect back, success or `error=`, and
+  refuses before reading `error=` when it is missing or wrong. It also deletes the store row of any
+  session cookie the browser already presents before creating the new session.
 - **The id_token** is verified with the account's JWKS: signature, `iss`, `aud` = clientId (and
   `azp` when there are several audiences), `exp`, `iat` (not in the future, at most 10 minutes old),
   `nonce` (against the stored hash), `sub`, the `algorithms` allow-list, and `email_verified === true`
@@ -106,11 +117,17 @@ Anything else (`//host`, `/\host`, an absolute URL, control characters, a backsl
   absolute 30 days from `auth_time` (else from sign-in; a future `auth_time` counts as now).
 - **Sign-out** is POST only and refuses a cross-origin `Origin`. It works with no session
   (`client_id` instead of `id_token_hint`) and always clears the cookie.
-- **Back-channel logout** checks `iss`, `aud`, `typ: logout+jwt`, `iat` (at most 5 minutes old),
+- **Back-channel logout** refuses a body over 16 KB (by `Content-Length`, and by reading at most
+  16 KB), then checks `iss`, `aud`, `typ: logout+jwt`, `iat` (at most 5 minutes old),
   the `http://schemas.openid.net/event/backchannel-logout` event, `sid` or `sub`, no `nonce`, and
   `jti` replay through the store. It ends sessions by `sid` (and `sub` when given), else by `sub`.
 - **`endFor`** deletes rows (they hold email, name and id_token), never marks them.
-- **The rate limit** counts `start:<ip>` and `callback:<ip>` from `ipHeader` only.
+- **The rate limit** counts `start:<addr>` and `callback:<addr>` from `ipHeader` only, where
+  `<addr>` is an IPv4 address, or an IPv6 address by its /64 (an IPv4-mapped address counts as its
+  IPv4). By default 10 per key per 60 seconds, set with `rateLimit: { limit, windowS }`.
+  **A request whose `ipHeader` is missing or holds no address is not limited** (by the default
+  limiter or a function), rather than putting every such request into one shared bucket. On
+  Cloudflare `cf-connecting-ip` is always set; behind anything else, make sure the header is.
 - **Nothing secret is logged or put in an error**: logs carry event names and reason codes only.
 
 ## Store
@@ -137,7 +154,10 @@ earlier call's answer. When the account cannot answer it throws `AccountUnavaila
 ## Tests in a product
 
 ```ts
-import { issueSessionForTests, sessionIdHash } from "@forspring/suite-signin";
+// A separate entry, kept out of the main one so a Worker cannot import it by accident.
+import { issueSessionForTests } from "@forspring/suite-signin/testing";
 const { raw } = await issueSessionForTests(store, { sub: "acct_1", email: "a@example.test" });
 const req = new Request(url, { headers: { cookie: `__Host-sitespring_session=${raw}` } });
 ```
+
+`sessionIdHash(raw)` (the SHA-256 the store keys a session by) stays in the main entry.

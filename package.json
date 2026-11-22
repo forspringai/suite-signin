@@ -25,6 +25,10 @@
       "types": "./dist/d1.d.ts",
       "default": "./dist/d1.js"
     },
+    "./testing": {
+      "types": "./dist/testing.d.ts",
+      "default": "./dist/testing.js"
+    },
     "./package.json": "./package.json"
   },
   "scripts": {
